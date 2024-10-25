@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Koi Fish Growth and Feeding Prediction</title>
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        max-width: 800px;
+        margin: 0 auto;
+        padding: 20px;
+      }
+      button {
+        margin: 10px 0;
+      }
+      #prediction,
+      #feedback {
+        margin-top: 20px;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Koi Fish Growth and Feeding Prediction</h1>
+    <button onclick="generateRandomData()">Generate Random Data</button>
+    <div id="randomData"></div>
+    <button onclick="predict()">Predict Growth and Feeding</button>
+    <div id="prediction"></div>
+    <div id="feedback">
+      <h3>Was the prediction correct?</h3>
+      <input type="text" id="feedbackUrl" placeholder="Enter URL" />
+      <button onclick="provideFeedback()">Provide Feedback</button>
+    </div>
+
+    <script>
+      let currentData = {};
+
+      function generateRandomData() {
+        const age_month = Math.floor(Math.random() * 60) + 1;
+        const length = Math.round((Math.random() * 40 + 10) * 10) / 10;
+        const weight = Math.round((Math.random() * 5000 + 500) * 10) / 10;
+        const pond_id = Math.floor(Math.random() * 5) + 1;
+        const water_quality = {
+          temperature: Math.round((Math.random() * 15 + 10) * 10) / 10,
+          pH: Math.round((Math.random() * 2 + 6) * 10) / 10,
+          ammonia: Math.round(Math.random() * 100) / 100,
+          nitrite: Math.round(Math.random() * 100) / 100,
+          nitrate: Math.round(Math.random() * 100) / 100,
+        };
+
+        currentData = { age_month, length, weight, water_quality, pond_id };
+
+        document.getElementById("randomData").innerHTML = `
+          <p>Age: ${age_month} months</p>
+          <p>Length: ${length} cm</p>
+          <p>Weight: ${weight} g</p>
+          <p>Pond ID: ${pond_id}</p>
+          <p>Water Quality:</p>
+          <ul>
+            <li>Temperature: ${water_quality.temperature}°C</li>
+            <li>pH: ${water_quality.pH}</li>
+            <li>Ammonia: ${water_quality.ammonia} ppm</li>
+            <li>Nitrite: ${water_quality.nitrite} ppm</li>
+            <li>Nitrate: ${water_quality.nitrate} ppm</li>
+          </ul>
+        `;
+      }
+
+      async function predict() {
+        const response = await fetch(
+          "http://localhost:8000/predict_growth_and_feeding",
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(currentData),
+          }
+        );
+        const result = await response.json();
+        document.getElementById("prediction").innerHTML = `
+          <h3>Prediction:</h3>
+          <p>Growth: ${result.predicted_growth}</p>
+          <p>Confidence: ${(result.confidence * 100).toFixed(2)}%</p>
+          <h4>Feeding Recommendation:</h4>
+          <p>Stage: ${result.feeding_recommendation.stage}</p>
+          <p>Daily Food Amount: ${
+            result.feeding_recommendation.daily_food_amount
+          } g</p>
+          <p>Feeding Frequency: ${
+            result.feeding_recommendation.feeding_frequency
+          }</p>
+          <p>Food Type: ${result.feeding_recommendation.food_type}</p>
+        `;
+      }
+
+      async function provideFeedback() {
+        const feedbackData = {
+          url: document.getElementById("feedbackUrl").value, // Replace with an actual URL
+        };
+
+        const response = await fetch("http://localhost:8000/feedback", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(feedbackData),
+        });
+
+        const result = await response.json();
+        alert(result.message);
+      }
+    </script>
+  </body>
+</html>

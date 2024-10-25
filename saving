@@ -1,0 +1,599 @@
+# Import các thư viện cần thiết
+from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, HttpUrl
+from sqlalchemy import create_engine, Column, Integer, String, Float, JSON, DateTime, ForeignKey
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+from datasets import Dataset
+import asyncio
+import requests
+from bs4 import BeautifulSoup
+from datetime import datetime
+import numpy as np
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, pipeline, TrainingArguments, Trainer
+import logging
+import threading
+import time
+import json
+
+# Thiết lập logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Thiết lập cơ sở dữ liệu
+SQLALCHEMY_DATABASE_URL = "sqlite:////app/data/koi_database.db"
+engine = create_engine(SQLALCHEMY_DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+# Định nghĩa các model cho cơ sở dữ liệu
+class PredictionFeedbackModel(Base):
+    __tablename__ = "prediction_feedback"
+    id = Column(Integer, primary_key=True, index=True)
+    koi_info_id = Column(Integer, ForeignKey('koi_info.id'))
+    user_growth_class = Column(String)
+    comment = Column(String)
+    timestamp = Column(DateTime, default=datetime.utcnow)
+
+class KeywordModel(Base):
+    __tablename__ = "keywords"
+    id = Column(Integer, primary_key=True, index=True)
+    keyword = Column(String, unique=True, index=True)
+
+class FeedbackModel(Base):
+    __tablename__ = "feedback"
+    id = Column(Integer, primary_key=True, index=True)
+    url = Column(String)
+    content = Column(String)
+    extracted_info = Column(JSON)
+    timestamp = Column(DateTime, default=datetime.utcnow)
+
+class KoiInfoModel(Base):
+    __tablename__ = "koi_info"
+    id = Column(Integer, primary_key=True, index=True)
+    age_month = Column(Float)
+    length = Column(Float)
+    weight = Column(Float)
+    water_quality = Column(JSON)
+    pond_id = Column(Integer)
+    predicted_growth = Column(String)
+    confidence = Column(Float)
+    timestamp = Column(DateTime, default=datetime.utcnow)
+
+# Tạo các bảng trong cơ sở dữ liệu
+Base.metadata.create_all(bind=engine)
+
+# Thiết lập FastAPI
+app = FastAPI()
+app.mount("/static", StaticFiles(directory="app/static"), name="static")
+
+# Thiết lập CORS middleware
+from fastapi.middleware.cors import CORSMiddleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Tải mô hình NLP cho dự đoán tăng trưởng cá Koi
+tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased")
+model = AutoModelForSequenceClassification.from_pretrained("distilbert-base-uncased", num_labels=4)
+classifier = pipeline("text-classification", model=model, tokenizer=tokenizer)
+
+# Định nghĩa các lớp tăng trưởng cho cá Koi
+growth_classes = ['slow', 'normal', 'fast', 'mixed']
+
+# Định nghĩa các giai đoạn sống của cá Koi
+KOI_STAGES = {
+    'fry': (0, 1),
+    'juvenile': (1, 6),
+    'young': (6, 12),
+    'adolescent': (12, 24),
+    'adult': (24, float('inf'))
+}
+
+# Định nghĩa các model Pydantic cho dữ liệu đầu vào
+class PredictionFeedback(BaseModel):
+    koi_info_id: int
+    user_growth_class: str
+    comment: str = None
+
+class KoiData(BaseModel):
+    age_month: float
+    length: float
+    weight: float
+    water_quality: dict
+    pond_id: int
+
+class FeedbackData(BaseModel):
+    url: HttpUrl
+
+# Hàm lấy từ khóa từ cơ sở dữ liệu
+def get_keywords_from_db():
+    db = SessionLocal()
+    keywords = db.query(KeywordModel.keyword).all()
+    db.close()
+    return [keyword[0] for keyword in keywords]
+
+# Cập nhật biến KOI_KEYWORDS
+KOI_KEYWORDS = get_keywords_from_db()
+
+# Các hàm hỗ trợ
+def get_koi_stage(age_month):
+    for stage, (min_age, max_age) in KOI_STAGES.items():
+        if min_age <= age_month < max_age:
+            return stage
+    return 'adult'  # Default to adult if age is beyond all defined stages
+
+def get_food_type(stage, growth_class):
+    if stage == 'fry':
+        return "High-protein liquid or powdered fry food"
+    elif stage == 'juvenile':
+        return "Small pellet or crushed pellet koi food with high protein content"
+    elif stage == 'young':
+        return "Medium-sized pellet koi food with balanced nutrition"
+    elif stage == 'adolescent':
+        if growth_class == 'slow':
+            return "High-protein growth formula"
+        elif growth_class == 'fast':
+            return "Balanced nutrition with moderate protein"
+        else:
+            return "Standard koi food with color-enhancing ingredients"
+    else:  # adult
+        if growth_class == 'slow':
+            return "High-protein adult koi food"
+        elif growth_class == 'fast':
+            return "Maintenance formula with lower protein"
+        else:
+            return "Standard adult koi food with color-enhancing ingredients"
+
+def get_feeding_frequency(stage):
+    if stage == 'fry':
+        return "6-8 times per day"
+    elif stage == 'juvenile':
+        return "4-5 times per day"
+    elif stage == 'young':
+        return "3-4 times per day"
+    elif stage == 'adolescent':
+        return "2-3 times per day"
+    else:  # adult
+        return "1-2 times per day"
+
+def get_feeding_recommendation(growth_class, age_month, weight, water_quality):
+    stage = get_koi_stage(age_month)
+    base_feeding_rate = 0.03  # 3% of body weight as a base
+    
+    if growth_class == 'slow':
+        feeding_rate = base_feeding_rate * 1.2
+    elif growth_class == 'normal':
+        feeding_rate = base_feeding_rate
+    elif growth_class == 'fast':
+        feeding_rate = base_feeding_rate * 0.8
+    else:  # mixed
+        feeding_rate = base_feeding_rate
+    
+    # Adjust for stage
+    if stage == 'fry':
+        feeding_rate *= 1.5
+    elif stage == 'juvenile':
+        feeding_rate *= 1.3
+    elif stage == 'young':
+        feeding_rate *= 1.1
+    elif stage == 'adult':
+        feeding_rate *= 0.9
+    
+    # Adjust for water quality
+    if 'temperature' in water_quality:
+        if water_quality['temperature'] < 15 or water_quality['temperature'] > 28:
+            feeding_rate *= 0.8
+    
+    daily_food_amount = weight * feeding_rate
+    
+    return {
+        'stage': stage,
+        'daily_food_amount': round(daily_food_amount, 2),
+        'feeding_frequency': get_feeding_frequency(stage),
+        'food_type': get_food_type(stage, growth_class)
+    }
+
+
+@app.post('/predict_growth_and_feeding')
+def predict_growth_and_feeding(data: KoiData):
+    input_text = f"Age: {data.age_month} months, Length: {data.length} cm, Weight: {data.weight} g, Water Quality: {data.water_quality}, Pond ID: {data.pond_id}"
+    prediction = classifier(input_text)[0]
+    
+    label_to_index = {'LABEL_0': 0, 'LABEL_1': 1, 'LABEL_2': 2, 'LABEL_3': 3}
+    index = label_to_index.get(prediction['label'], 0)
+    growth_class = growth_classes[min(index, len(growth_classes) - 1)]
+    confidence = prediction['score']
+    
+    logger.info(f"Predicted growth class: {growth_class}, Confidence: {confidence}")
+    feeding_recommendation = get_feeding_recommendation(growth_class, data.age_month, data.weight, data.water_quality)
+    
+    # Store koi information in the database
+    db = SessionLocal()
+    db_koi_info = KoiInfoModel(
+        age_month=data.age_month,
+        length=data.length,
+        weight=data.weight,
+        water_quality=data.water_quality,
+        pond_id=data.pond_id,
+        predicted_growth=growth_class,
+        confidence=confidence
+    )
+    db.add(db_koi_info)
+    db.commit()
+    db.close()
+
+    return {
+        'koi_info_id': 1,
+        'predicted_growth': growth_class,
+        'confidence': confidence,
+        'feeding_recommendation': feeding_recommendation
+    }
+
+@app.get("/training", response_class=FileResponse)
+async def get_training_html():
+    return FileResponse("app/training.html")
+
+@app.get('/koi_info')
+def get_koi_info(limit: int = 10):
+    db = SessionLocal()
+    koi_info = db.query(KoiInfoModel).order_by(KoiInfoModel.timestamp.desc()).limit(limit).all()
+    db.close()
+    return koi_info
+
+@app.get('/feedback_info')
+def get_feedback_info(limit: int = 10):
+    db = SessionLocal()
+    feedback_info = db.query(FeedbackModel).order_by(FeedbackModel.timestamp.desc()).limit(limit).all()
+    db.close()
+    return feedback_info
+
+def schedule_model_update():
+    logger.info("Starting model update scheduler")
+    while True:
+        asyncio.run(check_and_update_model())
+        time.sleep(300)  # Check every 5 minutes
+
+async def check_and_update_model():
+    db = SessionLocal()
+    feedback_count = db.query(FeedbackModel).count()
+    db.close()
+
+    if feedback_count >= 2:  # Adjust this threshold as needed
+        await update_model()
+
+@app.post('/feedback')
+async def receive_feedback(feedback: FeedbackData, background_tasks: BackgroundTasks):
+    background_tasks.add_task(process_feedback, feedback.url)
+    return {"message": "Feedback received. Website will be processed asynchronously."}
+
+async def process_feedback(url: str):
+    try:
+        response = requests.get(url)
+
+        # Trích xuất toàn bộ nội dung
+        soup = BeautifulSoup(response.text, 'html.parser')
+
+        # Trích xuất toàn bộ nội dung
+        full_text = soup.get_text()  
+
+        # Trích xuất thông tin dựa trên từ khóa
+        extracted_info = {};
+
+        for keyword in KOI_KEYWORDS:
+            # Tìm đoạn văn chứa từ khóa
+            paragraphs = soup.find_all('p')
+            relevant_paragraphs = [p.text for p in paragraphs if keyword.lower() in p.text.lower()]
+            
+            if relevant_paragraphs:
+                extracted_info[keyword] = relevant_paragraphs
+
+        url_str = str(url)
+        
+        # Giới hạn độ dài của full_text và extracted_info
+        max_length = 65535  # Giới hạn tối đa cho trường TEXT trong SQLite
+        full_text = full_text[:max_length]
+        extracted_info_str = json.dumps(extracted_info)[:max_length]
+
+        # Lưu thông tin trích xuất vào cơ sở dữ liệu
+        db = SessionLocal()
+        db_feedback = FeedbackModel(
+            url=url_str,
+            content=full_text,
+            extracted_info=extracted_info_str
+        )
+        
+        db.add(db_feedback)
+        db.commit()
+        db.close()
+
+        logger.info(f"Processed and stored content from {url}")
+        return extracted_info;
+    except Exception as e:
+        logger.error(f"Error processing {url}: {str(e)}")
+        return None;
+
+async def update_model():
+    global model, classifier, tokenizer
+
+    db = SessionLocal()
+    feedback_data = db.query(FeedbackModel).all()
+  
+    logger.info("Updating model with feedback data")
+      # Truy xuất dữ liệu cần thiết từ PredictionFeedbackModel và KoiInfoModel
+    prediction_feedback = db.query(PredictionFeedbackModel, KoiInfoModel).join(
+        KoiInfoModel, PredictionFeedbackModel.koi_info_id == KoiInfoModel.id
+    ).all()
+
+    db.close()
+
+    logger.info(f"Feedback data: {feedback_data}")
+    if len(feedback_data) < 2 and len(prediction_feedback) < 2:
+        logger.warning("Not enough data for meaningful update. Skipping model update.")
+        return
+
+    # Process feedback data
+       # Process feedback data
+    texts = []
+    labels = []
+    
+    logger.info(f"Feedback data: {feedback_data}")
+    for item in feedback_data:
+        extracted_info = json.loads(item.extracted_info)
+        text = " ".join([" ".join(paragraphs) for paragraphs in extracted_info.values()])
+        texts.append(text)
+    
+    logger.info(f"Prediction feedback data: {prediction_feedback}")
+    for item in prediction_feedback:
+        koi_info = item.koi_info
+        text = f"Age: {koi_info.age_month} months, Length: {koi_info.length} cm, Weight: {koi_info.weight} g, Water Quality: {koi_info.water_quality}, Pond ID: {koi_info.pond_id}"
+        
+        # Thêm comment vào text nếu có
+        if item.comment:
+            text += f" User comment: {item.comment}"
+        
+        texts.append(text)
+        labels.append(growth_classes.index(item.user_growth_class))
+    
+    dataset = Dataset.from_dict({'text': texts, 'label': labels})
+    
+    # Tokenize the dataset
+    def tokenize_function(examples):
+        return tokenizer(examples["text"], padding="max_length", truncation=True, max_length=512)
+
+    tokenized_dataset = dataset.map(tokenize_function, batched=True)
+
+    # Split the dataset
+    split_dataset = tokenized_dataset.train_test_split(test_size=0.2)
+    train_dataset = split_dataset['train']
+    eval_dataset = split_dataset['test']
+
+    # Set up training arguments
+    training_args = TrainingArguments(
+        output_dir="./results",
+        num_train_epochs=3,
+        per_device_train_batch_size=8,
+        per_device_eval_batch_size=8,
+        warmup_steps=500,
+        weight_decay=0.01,
+        logging_dir="./logs",
+        learning_rate=2e-5,
+    )
+
+    # Create Trainer
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+    )
+
+    # Fine-tune the model
+    trainer.train()
+
+    # Update the classifier with the new model
+    model = trainer.model
+    classifier = pipeline("text-classification", model=model, tokenizer=tokenizer)
+
+    logger.info("Model updated with feedback data")
+
+    # Clear the processed feedback data from the database
+    db = SessionLocal()
+    db.query(FeedbackModel).delete()
+    db.query(PredictionFeedbackModel).delete()
+    db.commit()
+    db.close()
+
+@app.get('/exatract_url')
+def extract_url():
+    url = [];
+    db = SessionLocal()
+    #Exatract only url 
+    feedback_info = db.query(FeedbackModel).order_by(FeedbackModel.timestamp.desc()).limit(1).all()
+    for item in feedback_info:
+        url.append(item.url)
+    db.close()
+    return url
+
+@app.get('/extracted_info')
+def get_extracted_info(limit: int = 10):
+    db = SessionLocal()
+    feedback_info = db.query(FeedbackModel).order_by(FeedbackModel.timestamp.desc()).limit(limit).all()
+    db.close()
+    
+    result = []
+    for item in feedback_info:
+        try:
+            extracted_info = json.loads(item.extracted_info)
+        except json.JSONDecodeError:
+            # Xử lý khi không thể giải mã JSON
+            logger.warning(f"Unable to decode JSON for item with URL: {item.url}")
+            extracted_info = {"error": "Invalid JSON data"}
+        
+        result.append({
+            "url": item.url,
+            "extracted_info": extracted_info
+        })
+    
+    return result
+@app.post('/add_keyword')
+def add_keyword(keyword: str):
+    db = SessionLocal()
+    existing = db.query(KeywordModel).filter(KeywordModel.keyword == keyword).first()
+    if existing:
+        db.close()
+        raise HTTPException(status_code=400, detail="Keyword already exists")
+    new_keyword = KeywordModel(keyword=keyword)
+    db.add(new_keyword)
+    db.commit()
+    db.close()
+    global KOI_KEYWORDS
+    KOI_KEYWORDS = get_keywords_from_db()
+    return {"message": f"Keyword '{keyword}' added successfully"}
+
+@app.delete('/remove_keyword')
+def remove_keyword(keyword: str):
+    db = SessionLocal()
+    existing = db.query(KeywordModel).filter(KeywordModel.keyword == keyword).first()
+    if not existing:
+        db.close()
+        raise HTTPException(status_code=404, detail="Keyword not found")
+    db.delete(existing)
+    db.commit()
+    db.close()
+    global KOI_KEYWORDS
+    KOI_KEYWORDS = get_keywords_from_db()
+    return {"message": f"Keyword '{keyword}' removed successfully"}
+
+@app.get('/keywords')
+def get_keywords():
+    return {"keywords": KOI_KEYWORDS}
+
+@app.post('/prediction_feedback')
+def add_prediction_feedback(feedback: PredictionFeedback):
+    db = SessionLocal()
+    db_feedback = PredictionFeedbackModel(
+        koi_info_id=feedback.koi_info_id,
+        user_growth_class=feedback.user_growth_class,
+        comment=feedback.comment
+    )
+    db.add(db_feedback)
+    db.commit()
+    db.refresh(db_feedback)
+    db.close()
+    return {"message": "Feedback received successfully", "feedback_id": db_feedback.id}
+
+@app.get('/test_predictions')
+def test_predictions():
+    test_cases = [
+        KoiData(
+            age_month=3,
+            length=10,
+            weight=50,
+            water_quality={
+                "temperature": 23,
+                "pH": 7.4,
+                "ammonia": 0.01,
+                "nitrite": 0.005,
+                "nitrate": 5
+            },
+            pond_id=1
+        ),
+        KoiData(
+            age_month=12,
+            length=30,
+            weight=500,
+            water_quality={
+                "temperature": 25,
+                "pH": 7.2,
+                "ammonia": 0.02,
+                "nitrite": 0.01,
+                "nitrate": 15
+            },
+            pond_id=2
+        ),
+        KoiData(
+            age_month=24,
+            length=50,
+            weight=2000,
+            water_quality={
+                "temperature": 22,
+                "pH": 7.6,
+                "ammonia": 0,
+                "nitrite": 0,
+                "nitrate": 20
+            },
+            pond_id=3
+        ),
+        KoiData(
+            age_month=36,
+            length=65,
+            weight=3500,
+            water_quality={
+                "temperature": 24,
+                "pH": 7.3,
+                "ammonia": 0.005,
+                "nitrite": 0.002,
+                "nitrate": 25
+            },
+            pond_id=1
+        ),
+        KoiData(
+            age_month=6,
+            length=20,
+            weight=200,
+            water_quality={
+                "temperature": 26,
+                "pH": 7.5,
+                "ammonia": 0.015,
+                "nitrite": 0.008,
+                "nitrate": 10
+            },
+            pond_id=2
+        )
+    ]
+
+    results = []
+    for case in test_cases:
+        result = predict_growth_and_feeding(case)
+        results.append({
+            "input_data": case.dict(),
+            "prediction_result": result
+        })
+
+    return results
+
+@app.on_event("startup")
+async def startup_event():
+    global KOI_KEYWORDS
+    KOI_KEYWORDS = get_keywords_from_db()
+    if not KOI_KEYWORDS:
+        # Nếu không có keywords trong DB, thêm một số mặc định
+        default_keywords = [
+            "koi", "carp", "nishikigoi", "growth rate", "feeding", "water quality",
+            "temperature", "pH", "ammonia", "nitrite", "nitrate", "oxygen",
+            "color", "pattern", "variety", "size", "weight", "age",
+            "breeding", "spawning", "disease", "treatment", "pond", "filter"
+        ]
+        
+        
+        db = SessionLocal()
+        for keyword in default_keywords:
+            db.add(KeywordModel(keyword=keyword))
+        db.commit()
+        db.close()
+        KOI_KEYWORDS = default_keywords
+    
+    logger.info("Application startup: Initializing model update thread")
+    threading.Thread(target=schedule_model_update, daemon=True).start()
+    logger.info("Model update thread started")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Koi Fish Health Prediction</title>
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        max-width: 800px;
+        margin: 0 auto;
+        padding: 20px;
+      }
+      button {
+        margin: 10px 0;
+      }
+      #prediction,
+      #feedback {
+        margin-top: 20px;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Koi Fish Health Prediction</h1>
+    <button onclick="generateRandomData()">Generate Random Data</button>
+    <div id="randomData"></div>
+    <button onclick="predict()">Predict Koi Health</button>
+    <div id="prediction"></div>
+    <div id="feedback">
+      <h3>Provide Feedback</h3>
+      <form id="feedbackForm">
+        <label for="trueHealthStatus">True Health Status:</label>
+        <select id="trueHealthStatus" required>
+          <option value="healthy">Healthy</option>
+          <option value="at risk">At Risk</option>
+          <option value="sick">Sick</option>
+        </select>
+        <button type="submit">Submit Feedback</button>
+      </form>
+    </div>
+    <div id="feedbackResult"></div>
+    <script>
+      let currentData = {};
+
+      function generateRandomData() {
+        currentData = {
+          age_months: Math.floor(Math.random() * 60) + 1,
+          length_cm: Math.round((Math.random() * 40 + 10) * 10) / 10,
+          weight_g: Math.floor(Math.random() * 5000) + 500,
+          water_temp: Math.round((Math.random() * 15 + 10) * 10) / 10,
+          ph: Math.round((Math.random() * 2 + 6) * 10) / 10,
+          ammonia: Math.round(Math.random() * 100) / 1000,
+          nitrite: Math.round(Math.random() * 100) / 1000,
+          activity_level: ["normal", "lethargic", "hyperactive"][
+            Math.floor(Math.random() * 3)
+          ],
+        };
+
+        document.getElementById("randomData").innerHTML = `
+          <p>Age: ${currentData.age_months} months</p>
+          <p>Length: ${currentData.length_cm} cm</p>
+          <p>Weight: ${currentData.weight_g} g</p>
+          <p>Water Temperature: ${currentData.water_temp}°C</p>
+          <p>pH: ${currentData.ph}</p>
+          <p>Ammonia: ${currentData.ammonia} ppm</p>
+          <p>Nitrite: ${currentData.nitrite} ppm</p>
+          <p>Activity Level: ${currentData.activity_level}</p>
+        `;
+      }
+
+      async function predict() {
+        const response = await fetch(
+          "http://localhost:9001/predict_koi_health",
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(currentData),
+          }
+        );
+        const result = await response.json();
+        document.getElementById("prediction").innerHTML = `
+          <h3>Prediction:</h3>
+          <p>Health Status: ${result.health_status}</p>
+          <p>Probability: ${(result.probability * 100).toFixed(2)}%</p>
+        `;
+      }
+
+      document
+        .getElementById("feedbackForm")
+        .addEventListener("submit", async function (event) {
+          event.preventDefault();
+          const feedbackData = {
+            ...currentData,
+            true_health_status:
+              document.getElementById("trueHealthStatus").value,
+          };
+
+          const response = await fetch("http://localhost:9001/feedback", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(feedbackData),
+          });
+
+          const result = await response.json();
+          document.getElementById("feedbackResult").innerHTML = `
+            <p>Feedback submitted successfully.</p>
+          `;
+
+          // Clear the form
+          document.getElementById("feedbackForm").reset();
+
+          //Delay clear of feedback result
+          setTimeout(() => {
+            document.getElementById("feedbackResult").innerHTML = "";
+          }, 3000);
+        });
+    </script>
+  </body>
+</html>

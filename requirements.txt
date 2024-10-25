@@ -1,0 +1,17 @@
+# fastapi
+# uvicorn
+# torch
+# numpy
+# scikit-learn
+# pydantic
+# pandas
+
+fastapi
+uvicorn
+torch
+transformers
+pandas
+datasets
+scikit-learn
+bitsandbytes
+accelerate>=0.26.0
